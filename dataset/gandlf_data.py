@@ -7,19 +7,23 @@ os.environ[
     'TORCHIO_HIDE_CITATION_PROMPT'] = '1'  # hides torchio citation request, see https://github.com/fepegar/torchio/issues/235
 import logging
 import numpy as np
-import sys
 import torch
 import torchio
 import pandas as pd
-import random
 
 from torch.utils.data import DataLoader
 
 import SimpleITK as sitk
 
 # put GANDLF in as a submodule staat pip install
-from GANDLF.data.ImagesFromDataFrame import ImagesFromDataFrame
+from .GANDLF.data.ImagesFromDataFrame import ImagesFromDataFrame
 
+import os
+import numpy as np
+
+
+# FIXME: Look to all usages and fix the fact that we are inspecting files multiple times
+#  for example we can optimize how we determine which patient directories to exlcude due to missing files
 def get_appropriate_file_paths_from_subject_dir(dir_path,
                                                 include_labels=False,
                                                 allowed_labelfile_endings=["_seg_binary.nii.gz",
@@ -75,53 +79,6 @@ def get_appropriate_file_paths_from_subject_dir(dir_path,
                 raise ValueError('No {} file found in {}, and handle_missing_datafiles is False.'.format(key, dir_path))
 
     return return_dict
-
-
-def get_dataframe_and_headers(file_data_full):
-    """
-    get the dataframe of subject filenames, and the headers of this dataframe.
-    Parameters:
-    file_data_full (string): Data csv file containing paths to patient scans and labels (if appropriate)
-
-    Copy of GANDLF.utils.parseTrainingCSV
-
-    Returns:
-        int: Description of return value
-    """
-
-    ## read training dataset into data frame
-    data_full = pd.read_csv(file_data_full)
-    # shuffle the data - this is a useful level of randomization for the training process
-    data_full = data_full.sample(frac=1).reset_index(drop=True)
-
-    # find actual header locations for input channel and label
-    # the user might put the label first and the channels afterwards
-    # or might do it completely randomly
-    headers = {}
-    headers['channelHeaders'] = []
-    headers['predictionHeaders'] = []
-    headers['labelHeader'] = None
-    headers['subjectIDHeader'] = None
-    for col in data_full.columns:
-        # add appropriate headers to read here, as needed
-        col_lower = col.lower()
-        currentHeaderLoc = data_full.columns.get_loc(col)
-        if ('channel' in col_lower) or ('modality' in col_lower) or ('image' in col_lower):
-            headers['channelHeaders'].append(currentHeaderLoc)
-        elif ('valuetopredict' in col_lower):
-            headers['predictionHeaders'].append(currentHeaderLoc)
-        elif ('subjectid' in col_lower) or ('patientname' in col_lower):
-            headers['subjectIDHeader'] = currentHeaderLoc
-        elif ('label' in col_lower) or ('mask' in col_lower) or ('segmentation' in col_lower) or (
-                'ground_truth' in col_lower) or ('groundtruth' in col_lower):
-            if (headers['labelHeader'] == None):
-                headers['labelHeader'] = currentHeaderLoc
-            else:
-                print('WARNING: Multiple label headers found in training CSV, only the first one will be used',
-                      file=sys.stderr)
-
-    return data_full, headers
-
 
 # adapted from https://codereview.stackexchange.com/questions/132914/crop-black-border-of-image-using-numpy/132933#132933
 def crop_image_outside_zeros(array, psize):
@@ -198,7 +155,7 @@ def fpaths_to_uid(fpaths):
 class GANDLFData(object):
 
     def __init__(self,
-                 data_path=None,
+                 data_path,
                  training_batch_size=1,
                  class_list=[0, 1, 2, 4],
                  patch_sampler='uniform',
@@ -221,8 +178,6 @@ class GANDLFData(object):
                  allow_new_data_into_previous_split=True,
                  handle_data_loss_from_previous_split=True,
                  force_rerun_with_recent_data_loss=True,
-                 federated_simulation_train_val_csv_path=None,
-                 federated_simulation_institution_name=None,
                  **kwargs):
 
         self.logger = logging.getLogger('openfl.model_and_data')
@@ -232,6 +187,10 @@ class GANDLFData(object):
         # dependency here with mode naming convention used in get_appropriate_file_paths_from_subject_dir
         self.feature_modes = ['T1', 'T2', 'FLAIR', 'T1CE']
         self.label_tag = 'Label'
+
+        self.data_path = data_path
+        if not os.path.exists(self.data_path):
+            raise ValueError('The provided data path: {} does not exits'.format(self.data_path))
 
         # using numerical header names
         self.numeric_header_names = {mode: idx + 1 for idx, mode in enumerate(self.feature_modes)}
@@ -253,10 +212,6 @@ class GANDLFData(object):
         self.inference_headers['channelHeaders'] = [self.numeric_header_names[mode] for mode in self.feature_modes]
         self.inference_headers['labelHeader'] = None
         self.inference_headers['predictionHeaders'] = []
-
-        self.numstring_to_num_headers = {str(name): name for name in self.numeric_header_names.values()}
-        # get the header number associated to the subject id as well
-        self.numstring_to_num_headers['0'] = 0
 
         self.divisibility_factor = divisibility_factor
         self.in_memory = in_memory
@@ -323,43 +278,12 @@ class GANDLFData(object):
         # do we throw exceptions for data subdirectories with missing files, or just skip them
         self.handle_missing_datafiles = handle_missing_datafiles
 
-        # hard-coded file names and strings
+        # hard-coded file name
         self.split_info_dirname = 'split_info'
-        fets_chall_magic_string = '__USE_DATA_PATH_AS_INSTITUTION_NAME__'
-
-        # Provides a way to define the train and val data directly for all institutions
-        #  of a simulated federation from a single csv (no cross-run sanity checks here)
-        self.federated_simulation_train_val_csv_path = federated_simulation_train_val_csv_path
-        self.federated_simulation_institution_name = federated_simulation_institution_name
-        if self.federated_simulation_train_val_csv_path is None:
-            if self.federated_simulation_institution_name is not None:
-                raise ValueError(
-                    'federated_simulation_train_val_csv_path needs to be provided when federated_simulation_institution_name is.')
-        else:
-            if self.federated_simulation_institution_name is None:
-                raise ValueError(
-                    'federated_simulation_institution_name needs to be provided when federated_simulation_train_val_csv_path is.')
-            elif self.federated_simulation_institution_name == fets_chall_magic_string:
-                if data_path is None:
-                    raise ValueError(
-                        "When federated_simulation_institution_name is set to str(fets_chall_magic_string), data_path must be provided.")
-                else:
-                    self.federated_simulation_institution_name = data_path
-            elif data_path is not None:
-                self.logger.warning(
-                    '\nfederated_simulation_train_val_csv_path has been provided, so data_path will be ignored.\n')
 
         #############################################################
         # The above attributes apply only to data-usage='train-val' #
         #############################################################
-
-        self.data_path = data_path
-        # if federated_simultation_train_val_csv_path is provided, we use it instead of data_path
-        if self.federated_simulation_train_val_csv_path is None:
-            if self.data_path is None:
-                raise ValueError('One of data_path or federated_simulation_train_val_csv_path must be provided.')
-            elif not os.path.exists(self.data_path):
-                raise ValueError('The provided data path: {} does not exits'.format(self.data_path))
 
         # append the split info directory
         self.excluded_subdirs.append(self.split_info_dirname)
@@ -375,45 +299,9 @@ class GANDLFData(object):
         self.validation_data_size = len(self.val_loader)
 
     def setup_for_train_val(self):
-        self.set_dataframe_headers(self.train_val_headers, list_needed=True)
-        if self.federated_simulation_train_val_csv_path is not None:
-            self.setup_for_train_val_no_cross_run_state()
-        else:
-            self.setup_for_train_val_w_cross_run_state()
-
-    def setup_for_train_val_no_cross_run_state(self):
-        # load the train val csv (should have info on sample paths for the train and val set of
-        # all insitutions of a federated learninng simulation
-        train_val_paths = pd.read_csv(self.federated_simulation_train_val_csv_path, dtype=str)
-        if 'InstitutionName' not in train_val_paths.columns:
-            raise ValueError("The train val csv must contain an 'InstitutionName' column, and it does not.")
-        if 'TrainOrVal' not in train_val_paths.columns:
-            raise ValueError("The train val csv must contain a 'TrainOrVal' column, and it does not.")
-        for header in self.headers_list:
-            if (header is not None) and (str(header) not in train_val_paths.columns):
-                raise ValueError(
-                    'The columns of the train val csv must contain all of {} and {} is not present in {}.'.format(
-                        self.headers_list, header, train_val_paths.columns))
-
-        # now convert the headers that are numstrings to numbers
-        train_val_paths.rename(self.numstring_to_num_headers, axis=1, inplace=True)
-
-        # restrict to the institution provided in the __init__ parameters
-        train_val_paths = train_val_paths[
-            train_val_paths['InstitutionName'] == self.federated_simulation_institution_name]
-
-        train_dataframe = train_val_paths[train_val_paths['TrainOrVal'] == 'train']
-        val_dataframe = train_val_paths[train_val_paths['TrainOrVal'] == 'val']
-
-        # now let's drop all of the columns we do not plan to use
-        columns_to_drop = list(set(list(train_val_paths.columns)).difference(set(self.headers_list)))
-        train_dataframe.drop(columns_to_drop, axis=1, inplace=True)
-        val_dataframe.drop(columns_to_drop, axis=1, inplace=True)
-
-        self.set_train_and_val_loaders(train_dataframe=train_dataframe, val_dataframe=val_dataframe)
-
-    def setup_for_train_val_w_cross_run_state(self):
         self.inference_loader = []
+
+        self.set_dataframe_headers(self.train_val_headers, list_needed=True)
 
         # FIXME: below contains some hard coded file names
         self.set_split_info_paths()
@@ -808,21 +696,10 @@ class GANDLFData(object):
                                    augmentations=augmentations,
                                    preprocessing=self.preprocessing,
                                    in_memory=self.in_memory)
-
-        ## added for reproducibility
-        def seed_worker(worker_id):
-            worker_seed = torch.initial_seed() % 2 ** 32
-            np.random.seed(worker_seed)
-            random.seed(worker_seed)
-
-        g = torch.Generator()
-        g.manual_seed(0)
-        ## added for reproducibility
-
         if train:
-            loader = DataLoader(data, shuffle=True, batch_size=self.batch_size, worker_init_fn=seed_worker, generator=g)
+            loader = DataLoader(data, shuffle=True, batch_size=self.batch_size)
         else:
-            loader = DataLoader(data, shuffle=False, batch_size=1, worker_init_fn=seed_worker, generator=g)
+            loader = DataLoader(data, shuffle=False, batch_size=1)
 
         companion_loader = None
         if train:
